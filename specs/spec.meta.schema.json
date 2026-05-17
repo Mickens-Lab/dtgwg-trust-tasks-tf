@@ -24,9 +24,9 @@
       "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*(/[a-z][a-z0-9]*(-[a-z0-9]+)*)*$",
       "anyOf": [
         { "not": { "pattern": "^trust-task($|-|/)" } },
-        { "enum": ["trust-task", "trust-task-error", "trust-task-ok", "trust-task-next-step"] }
+        { "enum": ["trust-task", "trust-task-error", "trust-task-ok", "trust-task-next-step", "trust-task-discovery"] }
       ],
-      "description": "Lowercase, hyphen-separated short name; may be organized into one or more `/`-delimited path segments (e.g. `acl/grant`). Each segment satisfies the single-segment grammar. The slug `trust-task` and any slug whose first segment is `trust-task` or begins with `trust-task-` are reserved per SPEC §6.1; only the framework-defined slugs `trust-task`, `trust-task-error`, `trust-task-ok`, and `trust-task-next-step` may use the reserved namespace (the registry hosts those itself). The slug MUST match the relative folder path from `specs/` to the version directory's parent."
+      "description": "Lowercase, hyphen-separated short name; may be organized into one or more `/`-delimited path segments (e.g. `acl/grant`). Each segment satisfies the single-segment grammar. The slug `trust-task` and any slug whose first segment is `trust-task` or begins with `trust-task-` are reserved per SPEC §6.1; only the framework-defined slugs `trust-task`, `trust-task-error`, `trust-task-ok`, `trust-task-next-step`, and `trust-task-discovery` may use the reserved namespace (the registry hosts those itself). The slug MUST match the relative folder path from `specs/` to the version directory's parent."
     },
     "version": {
       "type": "string",
@@ -139,6 +139,11 @@
       "type": "string",
       "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*(/[a-z][a-z0-9]*(-[a-z0-9]+)*)*(/(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*))?$",
       "description": "Successor reference for a `retired` specification, per SPEC §7.3 item 11. `<slug>` form points at the latest non-retired version of that slug; `<slug>/<MAJOR.MINOR>` pins to a specific version. The build script enforces that this field is only set when `status: retired`."
+    },
+    "bearer": {
+      "type": "boolean",
+      "default": false,
+      "description": "Opt-out from the audience-binding rule of SPEC §4.8.2. When true, documents conforming to this specification MAY omit `recipient` even when `proof` is present, because the payload's assertion is meaningful to any consumer that can verify the producer's identity (a public attestation, heartbeat, etc.). A bearer specification MUST also declare its `recipient` party as OPTIONAL. The default is false (non-bearer). See SPEC §4.8.3 and §7.3 item 12."
     }
   }
 }

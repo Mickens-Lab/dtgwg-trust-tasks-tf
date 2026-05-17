@@ -1,0 +1,111 @@
+name: Rust
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    paths:
+      - "trust-tasks-rs/**"
+      - "trust-tasks-codegen/**"
+      - "trust-tasks-https/**"
+      - "trust-tasks-didcomm/**"
+      - "trust-tasks-proof-affinidi/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "specs/**"
+      - ".github/workflows/rust.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  test:
+    name: cargo test (stable, full workspace)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Affinidi's TDK pulls in keyring / secret-storage crates whose
+      # build scripts probe for `libdbus-1` via pkg-config. Install the
+      # dev headers so libdbus-sys finds the system library.
+      - name: Install libdbus-1-dev
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - name: cargo test (default features)
+        run: cargo test --workspace --all-targets
+      - name: cargo test (--features validate)
+        run: cargo test -p trust-tasks-rs --features validate --all-targets
+      - name: cargo doc
+        run: cargo doc --workspace --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+  # NOTE: every crate in this workspace ends up declaring MSRV 1.94 —
+  # the Affinidi crate family requires it and the workspace resolves
+  # under a single Cargo.lock. A separate MSRV job would just retest
+  # the same toolchain as `test`. If the workspace ever splits its
+  # resolver, a `msrv` job picking a lower toolchain will be
+  # appropriate again.
+
+  fmt:
+    name: cargo fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: cargo clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install libdbus-1-dev
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - name: clippy (default features)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: clippy (--all-features)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  codegen-drift:
+    name: trust-tasks-codegen drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Run codegen
+        run: cargo run -p trust-tasks-codegen
+      # Codegen emits prettyplease-canonical output; the committed
+      # source has additionally been through `cargo fmt`, so normalise
+      # here before diffing.
+      - name: Format
+        run: cargo fmt --all
+      - name: Check for drift
+        run: |
+          if ! git diff --quiet trust-tasks-rs/src/specs; then
+            echo "::error::Codegen output is stale. Run \`cargo run -p trust-tasks-codegen && cargo fmt --all\` and commit the diff."
+            git diff trust-tasks-rs/src/specs
+            exit 1
+          fi
+
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features
