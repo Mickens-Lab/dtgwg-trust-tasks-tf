@@ -29,16 +29,39 @@ uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 # Server (feature-gated)
-axum = { version = "0.8", optional = true, default-features = false, features = ["http1", "json", "tokio"] }
+axum = { version = "0.8", optional = true, default-features = false, features = [
+  "http1",
+  "json",
+  "tokio",
+] }
 tower = { version = "0.5", optional = true, default-features = false }
-tokio = { version = "1", optional = true, features = ["net", "rt", "macros", "sync"] }
+tokio = { version = "1", optional = true, features = [
+  "net",
+  "rt",
+  "macros",
+  "sync",
+] }
 
 # Client (feature-gated)
-reqwest = { version = "0.13", optional = true, default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13", optional = true, default-features = false, features = [
+  "json",
+  "rustls",
+] }
 
-# JWT bearer-auth adapter (feature-gated under `jwt`)
-jsonwebtoken = { version = "9", optional = true, default-features = false }
+# JWT bearer-auth adapter (feature-gated under `jwt`).
+# jsonwebtoken 10 split crypto into provider features — at least one of
+# `rust_crypto` / `aws_lc_rs` MUST be enabled. We pick `aws_lc_rs`:
+# the `rust_crypto` provider transitively pulls in `rsa` 0.9, which
+# carries the open Marvin-Attack advisory RUSTSEC-2023-0071 with no
+# patch available. `aws-lc-rs` is already in the workspace dep graph
+# via rustls, so reusing it here costs nothing extra.
+jsonwebtoken = { version = "10", optional = true, default-features = false, features = [
+  "aws_lc_rs",
+] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = [
+  "json",
+  "rustls",
+] }
