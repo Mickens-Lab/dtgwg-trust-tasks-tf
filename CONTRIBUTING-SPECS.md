@@ -83,6 +83,8 @@ Notes:
 
 - **`bearer: true` flips off audience binding — do not set it casually.** The default for any spec is non-bearer ([SPEC §4.8.3](SPEC.md#483-bearer-specifications)). Adding `bearer: true` to your front matter does two coupled things: it declares that documents conforming to your spec are intended for unspecified consumption (any party that can verify the `proof` is a legitimate recipient), and it causes the codegen to emit `Payload::IS_BEARER = true`. That constant in turn suppresses the audience-binding rule of [SPEC §4.8.2](SPEC.md#482-audience-binding) in every conforming consumer pipeline — a `proof`-carrying document with no in-band `recipient` is accepted instead of rejected with `malformed_request`. **Only set `bearer: true` when the audience-free property is intrinsic to the assertion your spec publishes** (public attestations, heartbeats, schema-publication announcements). A spec that should have been audience-bound but is mistakenly bearer-flagged is silently exposed to cross-recipient replay (SPEC §10.1) — there is no second check downstream. If `bearer: true` is set, the spec's `parties` declaration **MUST** also list `recipient` as `OPTIONAL`, and the prose **MUST** state what assertion the document conveys and why audience binding is inappropriate for it.
 
+- **`proofRequirement.requirement` is runtime-enforceable, not advisory.** The three values map to consumer behaviour through `Payload::IS_PROOF_REQUIRED` (codegen-emitted): `REQUIRED` sets the const to `true` and causes every conforming consumer pipeline to reject a proofless document with `proof_required` ([SPEC §7.2 item 7](SPEC.md#72-consumer-requirements)); `RECOMMENDED` and `OPTIONAL` leave the const at its trait default (`false`) and the pipeline accepts proofless documents (subject to the consumer's chosen `ProofPolicy`). Picking `REQUIRED` therefore commits every conforming consumer — including bindings without an in-band verifier — to reject proofless requests, which is the right outcome for evidentiary specs like `acl/grant` but makes the spec unreachable on bindings whose integrity guarantees are out-of-band until those bindings grow a verifier. **Pick `REQUIRED` only when the threat model genuinely needs transport-independent integrity** (audit replay, downstream corroboration, dispute resolution after the original transport has closed). For everyday request/response interactions whose integrity is already guaranteed by the transport, `RECOMMENDED` is the right default.
+
 After the closing `---`, write the human-readable specification: Abstract, Status, Conformance, Definitions, Examples, Security & Privacy, plus anything else useful. Use `##` for the top-level sections you want to appear in the on-page sidebar TOC. The website auto-builds the TOC from your `##` headings.
 
 ## Request and Response sections
@@ -180,6 +182,15 @@ errorCodes:
           type: array
           items: { type: string }
 ```
+
+### Extension authority: spec authors vs. consumer maintainers
+
+Two parties may need to mint codes under `<slug>:<local>`:
+
+- **Spec authors** declare canonical codes in `errorCodes` front matter when publishing or revising the spec. These are the codes every conforming consumer can rely on.
+- **Consumer maintainers** **MAY** mint additional codes for invariants the spec did not enumerate (for example, a maintainer-specific authorization guard). The slug **MUST** be the slug of the spec **being processed** — never that of a related spec. A consumer handling `acl/change-role` that needs to surface a "last authority protected" rejection emits `acl/change-role:last_authority_protected`, **not** `acl/revoke:last_authority_protected` even though the related rule is canonically declared on `acl/revoke`. A client dispatching on `payload.code` expects the slug to identify the request's own type; cross-slug codes break that contract.
+
+Per [SPEC.md §8.5](SPEC.md#85-extension-by-individual-trust-task-specifications), a consumer that does not recognize an extended `code` treats the error as `task_failed`, so maintainer-minted codes degrade gracefully for clients that only know the canonical set.
 
 ## Build and validate locally
 

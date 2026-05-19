@@ -19,8 +19,9 @@ use axum::Router;
 use serde::Serialize;
 use serde_json::Value;
 use trust_tasks_rs::{
-    discovery::DiscoveryRegistry, specs::trust_task_discovery::v0_1 as discovery, ErrorPayload,
-    ErrorResponse, Payload, RejectReason, StandardCode, TransportHandler, TrustTask,
+    discovery::DiscoveryRegistry, erase_verifier, specs::trust_task_discovery::v0_1 as discovery,
+    DynProofVerifier, ErrorPayload, ErrorResponse, Payload, ProofVerifier, RejectReason,
+    ResolvedParties, StandardCode, TransportHandler, TrustTask, PROOF_NOT_ACCEPTED_BY_POLICY,
 };
 use uuid::Uuid;
 
@@ -29,14 +30,22 @@ use crate::handler::HttpsHandler;
 use crate::status::status_for_code;
 
 /// Context handed to every spec handler — the transport-authenticated
-/// peer (when present) and convenience accessors for the inbound
-/// document's metadata.
+/// peer (when present), convenience accessors for the inbound
+/// document's metadata, and the SPEC §4.8.1-resolved party identities.
 #[derive(Debug, Clone)]
 pub struct RequestContext {
-    /// VID of the transport-authenticated sender, if any.
+    /// VID of the transport-authenticated sender, if any. Equivalent to
+    /// `resolved.issuer` when the in-band `issuer` is absent and the
+    /// transport authenticated a peer; preserved separately so handlers
+    /// can audit-log the distinction between in-band and derived.
     pub authenticated_sender: Option<String>,
     /// VID of the local party serving this request.
     pub local: Option<String>,
+    /// SPEC §4.8.1-resolved party identities (in-band wins over
+    /// transport-derived; transport fills in absent in-band values).
+    /// Handlers can use this directly instead of re-running
+    /// [`TransportHandler::resolve_parties`].
+    pub resolved: ResolvedParties,
 }
 
 /// A spec-specific handler stored type-erased in the dispatch table.
@@ -57,6 +66,7 @@ struct ServerState {
     local_vid: Option<String>,
     auth: Box<dyn Auth>,
     routes: HashMap<String, Route>,
+    verifier: Option<Arc<dyn DynProofVerifier>>,
 }
 
 /// Builder for [`HttpsServer`].
@@ -64,6 +74,7 @@ pub struct HttpsServerBuilder {
     local_vid: Option<String>,
     auth: Option<Box<dyn Auth>>,
     routes: HashMap<String, Route>,
+    verifier: Option<Arc<dyn DynProofVerifier>>,
 }
 
 impl HttpsServerBuilder {
@@ -83,6 +94,32 @@ impl HttpsServerBuilder {
         self
     }
 
+    /// Plug in an in-band [`ProofVerifier`]. When configured, the
+    /// server verifies the `proof` member of every proof-bearing
+    /// document and rejects with `proof_invalid` on failure; when
+    /// absent, the server rejects proof-bearing documents with
+    /// `malformed_request` (the
+    /// [`PROOF_NOT_ACCEPTED_BY_POLICY`](trust_tasks_rs::PROOF_NOT_ACCEPTED_BY_POLICY)
+    /// rule — matches `consume_inbound` under
+    /// [`ProofPolicy::RejectIfPresent`](trust_tasks_rs::ProofPolicy::RejectIfPresent)).
+    ///
+    /// The verifier is invoked between identity resolution (§7.2 item
+    /// 6) and the per-spec dispatch closure (`IS_PROOF_REQUIRED` check
+    /// and audience binding), so a failed signature short-circuits
+    /// before the user handler runs.
+    ///
+    /// Accepts any concrete [`ProofVerifier`] (e.g. from
+    /// `trust-tasks-proof`'s `affinidi` backend); the server stores it
+    /// behind [`trust_tasks_rs::DynProofVerifier`] for object-safe
+    /// dispatch.
+    pub fn with_verifier<V>(mut self, verifier: V) -> Self
+    where
+        V: ProofVerifier + Send + Sync + 'static,
+    {
+        self.verifier = Some(erase_verifier(verifier));
+        self
+    }
+
     /// Register a handler for the request payload type `P`. The handler
     /// receives the typed request and a [`RequestContext`]; it returns
     /// either the response payload (which the server wraps in a
@@ -99,6 +136,19 @@ impl HttpsServerBuilder {
         let dispatch: DispatchFn = Box::new(move |doc: TrustTask<Value>, ctx: &RequestContext| {
             // Downcast payload to P.
             let typed = downcast::<P>(doc)?;
+
+            // SPEC §7.2 item 7 — proof-required enforcement. The server
+            // has no in-band verifier, but a *spec* may still oblige
+            // every conforming consumer to refuse proofless documents
+            // (`proofRequirement.requirement: REQUIRED` in front matter
+            // ⇒ codegen-emitted `IS_PROOF_REQUIRED = true`). The
+            // proof-present case is rejected upstream in
+            // `dispatch_handler`; here we close the converse so REQUIRED
+            // specs cannot be processed without a proof simply because
+            // this binding does not verify.
+            if typed.proof.is_none() && P::IS_PROOF_REQUIRED {
+                return Err(RejectReason::ProofRequired);
+            }
 
             // SPEC §7.2 item 8 — audience binding. This is the first point
             // where we have a typed payload (and therefore P::IS_BEARER).
@@ -162,6 +212,7 @@ impl HttpsServerBuilder {
                 local_vid: self.local_vid,
                 auth,
                 routes: self.routes,
+                verifier: self.verifier,
             }),
         }
     }
@@ -182,6 +233,7 @@ impl HttpsServer {
             local_vid: None,
             auth: None,
             routes: HashMap::new(),
+            verifier: None,
         }
     }
 
@@ -225,7 +277,7 @@ async fn dispatch_handler(
 
     // ─── 3. Build the per-request HttpsHandler and resolve parties.
     let handler = HttpsHandler::new(state.local_vid.clone(), peer_vid);
-    let _resolved = match handler.resolve_parties(&doc) {
+    let resolved = match handler.resolve_parties(&doc) {
         Ok(r) => r,
         Err(consistency) => {
             let reason: RejectReason = consistency.into();
@@ -238,6 +290,48 @@ async fn dispatch_handler(
     let my_vid = state.local_vid.as_deref().unwrap_or("");
     if let Err(reason) = doc.validate_basic(now, my_vid) {
         return reject_response(Some(&handler), Some(&doc), reason);
+    }
+
+    // ─── 4a. Proof handling (SPEC §7.2 item 7 + §4.7.1). The dispatch
+    // pipeline applies one of two policies based on builder
+    // configuration:
+    //
+    //   * Verifier configured (`HttpsServerBuilder::with_verifier`):
+    //     mirror `ProofPolicy::Verify` — proof-bearing documents are
+    //     verified, failure rejects `proof_invalid`. Proofless
+    //     documents proceed; the per-spec `IS_PROOF_REQUIRED` check in
+    //     the dispatch closure catches REQUIRED specs.
+    //
+    //   * No verifier (default): mirror `ProofPolicy::RejectIfPresent`
+    //     — proof-bearing documents are rejected `malformed_request`
+    //     with the framework-shared `PROOF_NOT_ACCEPTED_BY_POLICY`
+    //     wire message. Silently dropping a producer's proof would
+    //     mislead them about the exchange's integrity guarantees, and
+    //     naming the server's configuration on the wire would let a
+    //     probe enumerate verifier coverage across a fleet.
+    if doc.proof.is_some() {
+        match &state.verifier {
+            Some(v) => {
+                if let Err(err) = v.verify_json(&doc).await {
+                    return reject_response(
+                        Some(&handler),
+                        Some(&doc),
+                        RejectReason::ProofInvalid {
+                            reason: err.to_string(),
+                        },
+                    );
+                }
+            }
+            None => {
+                return reject_response(
+                    Some(&handler),
+                    Some(&doc),
+                    RejectReason::MalformedRequest {
+                        reason: PROOF_NOT_ACCEPTED_BY_POLICY.to_string(),
+                    },
+                );
+            }
+        }
     }
 
     // ─── 5. Routing: look up the handler registered for this Type URI.
@@ -256,6 +350,7 @@ async fn dispatch_handler(
     let ctx = RequestContext {
         authenticated_sender: handler.peer().map(str::to_string),
         local: handler.local().map(str::to_string),
+        resolved,
     };
     let dispatch_result = (route.dispatch)(doc.clone(), &ctx);
 
@@ -364,12 +459,21 @@ fn build_error_response(
 }
 
 /// When `TransportHandler::reject` returns `None` (no transport-
-/// authenticated sender under identity_mismatch), we still need to
-/// produce *something* for the HTTP body — the alternative is dropping
-/// the TCP connection, which is worse for diagnostics. We synthesise a
-/// recipient-less error document; the HTTP transport's authenticated
-/// sender will see only the headers (status code + content type) and
-/// can choose to ignore the body.
+/// authenticated sender under identity_mismatch), the framework rule
+/// (SPEC §8.1) is that the consumer SHOULD NOT emit a response.
+/// HTTP, however, gives us no way to "not emit" — the TCP connection
+/// already exists and the peer is waiting for a status line. We
+/// produce a `trust-task-error/0.1` document with no `recipient`
+/// member set; the peer at the other end of the TCP socket *does*
+/// receive it (HTTP carries the bytes regardless of the in-band
+/// `recipient`), but the document itself is unaddressed and the body
+/// names no consumer-side identity. The status line + Content-Type
+/// header are unavoidable.
+///
+/// Note that this is the safer of the two HTTP-shaped options — the
+/// alternative (drop the connection) loses diagnostic value for
+/// honest peers caught by a transient identity glitch. The body
+/// stays terse and the message cites the spec.
 fn suppressed_error_response(new_id: &str, reason: RejectReason) -> ErrorResponse {
     let mut doc = TrustTask::new(
         new_id.to_string(),

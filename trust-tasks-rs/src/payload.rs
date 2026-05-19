@@ -19,6 +19,7 @@
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
+use crate::error::TrustTaskCode;
 use crate::type_uri::TypeUri;
 
 /// A Rust type that corresponds to one variant (request or response) of a
@@ -43,7 +44,34 @@ pub trait Payload: Serialize + DeserializeOwned {
     /// Consumers consult this constant via
     /// [`crate::TrustTask::enforce_audience_binding`] to apply SPEC.md §7.2
     /// item 8 without consulting the registry at runtime.
+    ///
+    /// The codegen emits this constant on both the request `Payload`
+    /// impl and the response `Response` impl (when the spec defines
+    /// one). The audience-binding check fires on request-side documents
+    /// only, so the constant on the response impl is informational —
+    /// downstream tooling that walks generated modules generically can
+    /// read it without special-casing variants.
     const IS_BEARER: bool = false;
+
+    /// Whether the originating *Trust Task specification* obliges a *consumer*
+    /// to reject a document that arrives without a `proof`, per SPEC.md §7.3
+    /// item 8 (`proofRequirement.requirement == "REQUIRED"`).
+    ///
+    /// Defaults to `false` (i.e. `OPTIONAL` or `RECOMMENDED` — the consumer
+    /// is free to accept a proofless document). The codegen emits an explicit
+    /// `const IS_PROOF_REQUIRED: bool = true;` override only when the spec's
+    /// front matter declares `proofRequirement.requirement: REQUIRED`.
+    ///
+    /// Consumers consult this constant via [`crate::consume_inbound`] to
+    /// apply SPEC.md §7.2 item 7 authoritatively per-spec, rather than as a
+    /// consumer-wide policy toggle.
+    ///
+    /// Like [`IS_BEARER`](Self::IS_BEARER), this constant is emitted on
+    /// both the request `Payload` impl and the response `Response` impl.
+    /// `consume_inbound` consults it on the request side; a producer
+    /// consuming a response would do the same check against the response
+    /// impl if its trust posture requires it.
+    const IS_PROOF_REQUIRED: bool = false;
 
     /// Parsed form of [`TYPE_URI`](Self::TYPE_URI).
     ///
@@ -55,5 +83,96 @@ pub trait Payload: Serialize + DeserializeOwned {
         Self::TYPE_URI
             .parse()
             .expect("TYPE_URI constant must be a valid Type URI")
+    }
+
+    /// Build an extended [`TrustTaskCode`] under this payload's slug, per
+    /// SPEC.md §8.5.
+    ///
+    /// Equivalent to writing:
+    ///
+    /// ```rust,ignore
+    /// TrustTaskCode::new_extended("acl/change-role", "last_authority_protected").unwrap()
+    /// ```
+    ///
+    /// but sources the slug from [`TYPE_URI`](Self::TYPE_URI) so the slug
+    /// literal cannot drift away from the type's identity. The §8.5
+    /// namespace rule ("the slug of the spec being processed") is then
+    /// enforced by construction.
+    ///
+    /// `local` is validated against `spec.meta.schema.json`'s
+    /// `errorCodes[].code` grammar (the part after the colon: lowercase
+    /// letter, then lowercase letters / digits / underscores). Panics on
+    /// an invalid `local` — this method is for static call-site usage;
+    /// callers handling runtime input should use
+    /// [`TrustTaskCode::new_extended`] and propagate the `Result`.
+    ///
+    /// Also panics under the same condition as
+    /// [`type_uri`](Self::type_uri): when [`TYPE_URI`](Self::TYPE_URI)
+    /// is not a valid Type URI, i.e. a static-string bug.
+    fn extended_code(local: impl Into<String>) -> TrustTaskCode {
+        let slug = Self::type_uri().slug().to_string();
+        let local = local.into();
+        TrustTaskCode::new_extended(&slug, &local).unwrap_or_else(|e| {
+            panic!(
+                "Payload::extended_code({:?}) on slug {:?} failed validation: {e}",
+                local, slug
+            )
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::specs::acl::change_role::v0_1 as change_role;
+    use crate::specs::acl::grant::v0_1 as grant;
+    use crate::specs::trust_task_discovery::v0_1 as discovery;
+
+    #[test]
+    fn extended_code_sources_slug_from_type_uri() {
+        let code = grant::Payload::extended_code("role_not_recognized");
+        match code {
+            TrustTaskCode::Extended { slug, local } => {
+                assert_eq!(slug, "acl/grant");
+                assert_eq!(local, "role_not_recognized");
+            }
+            other => panic!("expected Extended, got {other:?}"),
+        }
+
+        // Hierarchical slug — drift would be especially easy to hit by hand.
+        let code = change_role::Payload::extended_code("last_authority_protected");
+        assert_eq!(code.to_string(), "acl/change-role:last_authority_protected");
+    }
+
+    #[test]
+    fn extended_code_works_for_single_segment_slug() {
+        // Single-segment slug — no `/` in the namespace.
+        let code = discovery::Payload::extended_code("filter_unsupported");
+        assert_eq!(code.to_string(), "trust-task-discovery:filter_unsupported");
+    }
+
+    #[test]
+    #[should_panic(expected = "failed validation")]
+    fn extended_code_panics_on_invalid_local() {
+        // Capital letters violate the `errorCodes[].code` grammar — the
+        // resulting Extended would fail to round-trip through FromStr.
+        // The trait method panics so a static-string bug fails loudly
+        // instead of silently producing a code that fails parsing later.
+        let _ = grant::Payload::extended_code("BadLocal");
+    }
+
+    #[test]
+    fn extended_code_strips_response_fragment_from_slug() {
+        // Response payloads carry `#response` in their TYPE_URI. The
+        // helper MUST source the slug via `TypeUri::slug()`, which
+        // drops the fragment — otherwise an error code minted from a
+        // Response handler would name the wrong namespace.
+        let code = grant::Response::extended_code("role_not_recognized");
+        match code {
+            TrustTaskCode::Extended { slug, .. } => {
+                assert_eq!(slug, "acl/grant", "response variant must yield bare slug");
+            }
+            other => panic!("expected Extended, got {other:?}"),
+        }
     }
 }

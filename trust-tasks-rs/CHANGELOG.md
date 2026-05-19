@@ -6,6 +6,64 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to a `MAJOR.MINOR` versioning scheme that tracks
 the corresponding `SPEC.md` framework version.
 
+## [0.1.1] — 2026-05-19
+
+### Changed — consumer-pipeline hardening (SPEC §7.2 items 6 + 7)
+
+- **BREAKING**: `consume_inbound`'s handler signature changes from
+  `FnOnce(TrustTask<P>) -> Future<Result<TrustTask<R>, RejectReason>>`
+  to `FnOnce(TrustTask<P>, ResolvedParties) -> Future<Result<TrustTask<R>, ErrorResponse>>`.
+  Handlers now receive the SPEC §4.8.1-resolved parties (no need to call
+  `transport.resolve_parties` themselves) and return a fully-routed
+  `ErrorResponse` on refusal, freeing them to mint extended codes
+  (SPEC §8.5), attach task-specific `details`, and apply spec-specific
+  routing without being constrained to the framework's `RejectReason`
+  vocabulary. The docstring spells out that handler-built errors are
+  passed through verbatim — handlers that reject for identity-style
+  reasons MUST use `reject_with_recipient` or `TransportHandler::reject`
+  to preserve §8.1 routing.
+- **BREAKING**: `consume_inbound`'s `verifier: Option<&V>` parameter is
+  replaced by `policy: ProofPolicy<'_, V>` with three explicit variants:
+  `Verify(&V)`, `RejectIfPresent`, and `AcceptUnverified`. Forces the
+  security tradeoff to be a deliberate, audit-able choice at the call
+  site instead of an `Option::None` whose meaning was ambiguous. The
+  `AcceptUnverified` variant is the documented opt-out for transports
+  whose integrity guarantees live outside the in-band proof (signed
+  DIDComm envelopes, mTLS-bound HTTPS).
+- `consume_inbound` now reads `Payload::IS_PROOF_REQUIRED`
+  authoritatively for the SPEC §7.2 item 7 proof-required check,
+  replacing the `verifier.is_some() && !P::IS_BEARER` heuristic. Per-
+  spec proof contracts are enforced regardless of the chosen policy.
+- **SECURITY**: under `ProofPolicy::RejectIfPresent`, `consume_inbound`
+  rejects documents carrying an in-band proof with `malformed_request`.
+  Silently dropping a producer-supplied proof previously misled the
+  producer about the integrity guarantees of the exchange. The wire-
+  exposed `message` is a neutral constant — it cites the spec section
+  but does not name the consumer's configuration, so an unauthenticated
+  probe cannot fingerprint deployments by verifier coverage.
+
+### Added
+
+- `Payload::IS_PROOF_REQUIRED` (default `false`). Codegen emits an
+  explicit `const IS_PROOF_REQUIRED: bool = true;` override when a spec's
+  front matter declares `proofRequirement.requirement: REQUIRED`. Mirrors
+  the existing `IS_BEARER` plumbing.
+- `Payload::extended_code(local)` convenience trait method — builds a
+  `TrustTaskCode::Extended` under the payload's own slug (sourced from
+  `Self::TYPE_URI`). Eliminates slug-literal drift in handler code and
+  makes the SPEC §8.5 namespace rule enforceable by construction.
+  `TrustTaskCode::new_extended(slug, local) -> Result<Self, ParseCodeError>`
+  is the runtime-input-safe constructor.
+- `DynProofVerifier` trait + `ErasedVerifier<V>` adapter + `erase_verifier`
+  helper. Object-safe wrapper around [`ProofVerifier`] for transport
+  bindings that need to store a verifier behind `Arc<dyn …>` on shared
+  state (the generic method on `ProofVerifier::verify` is not
+  object-safe). Reusable across bindings (HTTPS, future DIDComm, …).
+- `PROOF_NOT_ACCEPTED_BY_POLICY` constant — the wire-safe message
+  shared by `consume_inbound` and transport bindings for the
+  proof-without-verifier rejection. Sanitised: no mention of the
+  consumer's configuration that could be used as a probe oracle.
+
 ## [0.1.0] — initial pre-release, tracks `SPEC.md` 0.1
 
 ### Added — framework primitives
@@ -84,4 +142,5 @@ the corresponding `SPEC.md` framework version.
 - `TypeUri` parser accepts `trust-task-discovery` as a framework-defined
   slug per the SPEC §6.1 reserved-slug list.
 
+[0.1.1]: https://github.com/trustoverip/dtgwg-trust-tasks-tf/releases/tag/trust-tasks-rs-v0.1.1
 [0.1.0]: https://github.com/trustoverip/dtgwg-trust-tasks-tf/releases/tag/v0.1.0

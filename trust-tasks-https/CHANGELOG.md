@@ -4,6 +4,51 @@ All notable changes to `trust-tasks-https` are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this crate tracks `trust-tasks-rs`'s `MAJOR.MINOR`.
 
+## [0.1.1] — 2026-05-19
+
+### Added
+
+- `HttpsServerBuilder::with_verifier(verifier)` — plug in any
+  `trust_tasks_rs::ProofVerifier` implementation. When configured, the
+  server verifies the `proof` member of every proof-bearing inbound
+  document and rejects `proof_invalid` on failure; when absent, the
+  server rejects proof-bearing documents with `malformed_request` as
+  before. Stored internally as `Arc<DynProofVerifier>` for object-safe
+  dispatch. This lets `acl/grant` / `acl/revoke` / `acl/change-role`
+  (all `proofRequirement: REQUIRED`) flow end-to-end on the binding
+  once a verifier is configured — without one, `IS_PROOF_REQUIRED`
+  enforcement still fires per the security fix above.
+- `RequestContext.resolved: ResolvedParties` — handlers can now read
+  the SPEC §4.8.1-resolved issuer/recipient pair directly instead of
+  re-running `TransportHandler::resolve_parties` to re-derive what the
+  dispatch pipeline already computed. Matches the ergonomic improvement
+  in `trust-tasks-rs` `consume_inbound`'s handler signature.
+
+### Fixed — security
+
+- The server previously accepted documents carrying a `proof` member
+  without verifying it (the binding has no in-band verifier). A producer
+  that signed its document and saw a 200 had no way to learn that the
+  signature was never checked. The server now rejects proof-bearing
+  documents with `malformed_request` at the framework-checks stage,
+  matching the same rule `consume_inbound` now applies under
+  `ProofPolicy::RejectIfPresent`. The wire-exposed reason is the
+  framework-shared `PROOF_NOT_ACCEPTED_BY_POLICY` constant — naming
+  the server's configuration would let an unauthenticated probe
+  fingerprint verifier coverage across a fleet.
+- The server previously accepted *proofless* documents on specs whose
+  front matter declares `proofRequirement.requirement: REQUIRED` —
+  silently violating SPEC §7.2 item 7. The dispatch closure now
+  consults `Payload::IS_PROOF_REQUIRED` after downcast and rejects with
+  `proof_required` when the spec requires a proof and none is present,
+  regardless of whether the binding is configured to verify.
+  Combined with the verifier plug-in point added under "Added" below,
+  REQUIRED specs (e.g. `acl/grant`, `acl/revoke`, `acl/change-role`)
+  now flow end-to-end on the binding when a verifier is wired in via
+  `HttpsServerBuilder::with_verifier`; without a verifier they are
+  correctly refused with `proof_required` (proofless) or
+  `malformed_request` (proof-bearing, the policy rejection above).
+
 ## [0.1.0] — initial pre-release, tracks `trust-tasks-rs` 0.1, `SPEC.md` 0.1
 
 ### Added
@@ -45,4 +90,5 @@ this crate tracks `trust-tasks-rs`'s `MAJOR.MINOR`.
 - `client` (default) — `HttpsClient` + `reqwest`.
 - `server` (default) — `HttpsServer` + `axum` + `tokio` + `tower`.
 
+[0.1.1]: https://github.com/trustoverip/dtgwg-trust-tasks-tf/releases/tag/trust-tasks-https-v0.1.1
 [0.1.0]: https://github.com/trustoverip/dtgwg-trust-tasks-tf/releases/tag/v0.1.0
