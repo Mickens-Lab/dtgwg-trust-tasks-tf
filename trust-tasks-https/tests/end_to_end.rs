@@ -616,3 +616,126 @@ async fn permission_denied_from_spec_handler() {
         other => panic!("expected TrustTaskError, got {other:?}"),
     }
 }
+
+// ─── SPEC §10.2 parser hardening (pre-auth DoS controls) ──────────────────
+
+/// An over-limit body is rejected by the router's `DefaultBodyLimit` before
+/// it is buffered, parsed, or authenticated — an audited memory-exhaustion
+/// control (SPEC §10.2). 512 KiB exceeds the 256 KiB cap.
+#[tokio::test]
+async fn oversized_body_is_rejected_before_processing() {
+    let addr = spawn_server().await;
+    let big = vec![b'a'; 512 * 1024];
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/trust-tasks"))
+        .body(big)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+/// A pathologically nested JSON body within the size budget exceeds
+/// `serde_json`'s default 128-level recursion limit, so it fails to parse
+/// (→ `malformedRequest`/400) rather than overflowing the stack.
+#[tokio::test]
+async fn deeply_nested_body_fails_to_parse_not_overflow() {
+    let addr = spawn_server().await;
+    let body = "[".repeat(1000) + &"]".repeat(1000);
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/trust-tasks"))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+// ─── Regressions from the PR #75 security re-review ───────────────────────
+
+/// SPEC §10.4 — the suppressed identity-mismatch path must be indistinguishable
+/// from a plain parse failure: same HTTP status AND same body code. Previously
+/// the body was a generic `malformedRequest` but the status stayed 403 (derived
+/// from the original IdentityMismatch reason), leaking a 403-vs-400 oracle to an
+/// unauthenticated prober.
+#[tokio::test]
+async fn suppressed_identity_mismatch_is_indistinguishable_from_parse_failure() {
+    let addr = spawn_server().await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{addr}/trust-tasks");
+
+    // No bearer + in-band recipient that mismatches the server VID → the server
+    // cannot address a response (no transport sender) → suppressed path.
+    let mismatch = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .body(
+            serde_json::json!({
+                "id": "urn:uuid:probe",
+                "type": "https://trusttasks.org/spec/acl/grant/0.1",
+                "issuer": "did:web:alice.example",
+                "recipient": "did:web:wrong.example",
+                "payload": { "entry": { "subject": "did:web:carol.example", "role": "admin" } }
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let mismatch_status = mismatch.status();
+    let mismatch_code =
+        mismatch.json::<serde_json::Value>().await.unwrap()["payload"]["code"].clone();
+
+    // A garbage body → genuine parse failure.
+    let garbage = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .body("not json")
+        .send()
+        .await
+        .unwrap();
+    let garbage_status = garbage.status();
+    let garbage_code =
+        garbage.json::<serde_json::Value>().await.unwrap()["payload"]["code"].clone();
+
+    assert_eq!(mismatch_status, reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        mismatch_status, garbage_status,
+        "status must not distinguish the two"
+    );
+    assert_eq!(mismatch_code, serde_json::json!("malformedRequest"));
+    assert_eq!(
+        mismatch_code, garbage_code,
+        "body code must not distinguish the two"
+    );
+}
+
+/// SPEC §7.2 item 5b — recipient-REQUIRED must be enforced on the HTTPS pipeline
+/// too (not only the library `consume_inbound` path). acl/grant declares its
+/// recipient REQUIRED; a document with no in-band recipient is malformed even
+/// though the transport could fill it.
+#[tokio::test]
+async fn https_enforces_recipient_required_with_no_in_band_recipient() {
+    let addr = spawn_server().await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/trust-tasks"))
+        .header("authorization", "Bearer alice")
+        .header("content-type", "application/json")
+        .body(
+            serde_json::json!({
+                "id": "urn:uuid:no-recip",
+                "type": "https://trusttasks.org/spec/acl/grant/0.1",
+                "issuer": "did:web:alice.example",
+                "payload": { "entry": { "subject": "did:web:carol.example", "role": "admin" } }
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let code = resp.json::<serde_json::Value>().await.unwrap()["payload"]["code"].clone();
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(code, serde_json::json!("malformedRequest"));
+}

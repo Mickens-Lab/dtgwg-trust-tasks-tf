@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -28,6 +28,12 @@ use uuid::Uuid;
 use crate::auth::{Auth, BearerAuth};
 use crate::handler::HttpsHandler;
 use crate::status::status_for_code;
+
+/// Maximum accepted request-body size (SPEC §10.2). Trust Task payloads are
+/// small; 256 KiB is generous headroom while bounding pre-auth memory use.
+/// Callers needing a different bound can rebuild the router with their own
+/// [`DefaultBodyLimit`] layer.
+const MAX_BODY_BYTES: usize = 256 * 1024;
 
 /// Context handed to every spec handler — the transport-authenticated
 /// peer (when present), convenience accessors for the inbound
@@ -137,22 +143,15 @@ impl HttpsServerBuilder {
             // Downcast payload to P.
             let typed = downcast::<P>(doc)?;
 
-            // SPEC §7.2 item 7 — proof-required enforcement. The server
-            // has no in-band verifier, but a *spec* may still oblige
-            // every conforming consumer to refuse proofless documents
-            // (`proofRequirement.requirement: REQUIRED` in front matter
-            // ⇒ codegen-emitted `IS_PROOF_REQUIRED = true`). The
-            // proof-present case is rejected upstream in
-            // `dispatch_handler`; here we close the converse so REQUIRED
-            // specs cannot be processed without a proof simply because
-            // this binding does not verify.
-            if typed.proof.is_none() && P::IS_PROOF_REQUIRED {
-                return Err(RejectReason::ProofRequired);
-            }
-
-            // SPEC §7.2 item 8 — audience binding. This is the first point
-            // where we have a typed payload (and therefore P::IS_BEARER).
-            typed.enforce_audience_binding()?;
+            // SPEC §7.2 items 5b + 7A + 8 — the flag-driven per-spec checks
+            // (recipient-REQUIRED, proof-REQUIRED, audience binding). This is
+            // the first point where the typed payload (and its codegen-emitted
+            // flags) is available. It calls the SAME method as the library
+            // `consume_inbound` path (`TrustTask::enforce_spec_policy`) so the
+            // two pipelines cannot diverge on the check set. The non-typed
+            // checks (expiry, cross-check, proof verification) ran upstream in
+            // `dispatch_handler`.
+            typed.enforce_spec_policy()?;
 
             // Invoke user handler.
             let response_payload = handler(&typed, ctx)?;
@@ -239,9 +238,18 @@ impl HttpsServer {
 
     /// Build the axum [`Router`] without starting a listener — useful for
     /// integration tests that want to spawn the app inline.
+    ///
+    /// The router applies an explicit `DefaultBodyLimit` of
+    /// `MAX_BODY_BYTES` (256 KiB) as an audited DoS control (SPEC §10.2): the body is
+    /// buffered and parsed *before* authentication, so an unbounded body would
+    /// otherwise be a pre-auth memory-exhaustion vector. JSON nesting depth is
+    /// separately bounded by `serde_json`'s default 128-level recursion limit,
+    /// so a pathologically nested body within the size budget fails to parse
+    /// (→ `malformedRequest`) rather than overflowing the stack.
     pub fn into_router(self) -> Router {
         Router::new()
             .route("/trust-tasks", post(dispatch_handler))
+            .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
             .with_state(self.state)
     }
 
@@ -416,10 +424,14 @@ fn reject_response(
     request: Option<&TrustTask<Value>>,
     reason: RejectReason,
 ) -> Response {
-    let status = status_for_code(&reason.code().into());
-    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-
+    // Status follows the error document actually emitted, not the inbound
+    // reason. The suppressed identity-mismatch path rewrites the body to a
+    // generic `malformedRequest` (SPEC §10.4); the status MUST match so it is
+    // indistinguishable from a plain parse failure (no 403-vs-400 oracle for an
+    // unauthenticated prober).
     let error_doc = build_error_response(handler, request, reason);
+    let status = status_for_code(&error_doc.payload.code);
+    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let body = serde_json::to_vec(&error_doc).expect("serialise error response");
     (status, [(header::CONTENT_TYPE, "application/json")], body).into_response()
 }
@@ -438,7 +450,7 @@ fn build_error_response(
             // outbound recipient correctly).
             match h.reject(req, new_id.clone(), reason.clone()) {
                 Some(resp) => resp,
-                None => suppressed_error_response(&new_id, reason),
+                None => suppressed_error_response(&new_id),
             }
         }
         (_, Some(req)) => req.reject_with(new_id, reason),
@@ -448,7 +460,7 @@ fn build_error_response(
             // a TrustTask at all.
             let mut doc = TrustTask::new(
                 new_id,
-                trust_tasks_rs::TypeUri::canonical("trust-task-error", 0, 1)
+                trust_tasks_rs::TypeUri::canonical("trust-task-error", 0, 2)
                     .expect("framework type URI"),
                 ErrorPayload::from(reason),
             );
@@ -460,28 +472,25 @@ fn build_error_response(
 
 /// When `TransportHandler::reject` returns `None` (no transport-
 /// authenticated sender under identity_mismatch), the framework rule
-/// (SPEC §8.1) is that the consumer SHOULD NOT emit a response.
-/// HTTP, however, gives us no way to "not emit" — the TCP connection
-/// already exists and the peer is waiting for a status line. We
-/// produce a `trust-task-error/0.1` document with no `recipient`
-/// member set; the peer at the other end of the TCP socket *does*
-/// receive it (HTTP carries the bytes regardless of the in-band
-/// `recipient`), but the document itself is unaddressed and the body
-/// names no consumer-side identity. The status line + Content-Type
-/// header are unavoidable.
+/// (SPEC §8.1) is that the consumer SHOULD NOT emit a response. HTTP
+/// gives us no way to "not emit" — the TCP connection already exists and
+/// the peer is waiting for a status line. We therefore emit the *same*
+/// generic `malformedRequest`/400 that a body parse failure produces.
 ///
-/// Note that this is the safer of the two HTTP-shaped options — the
-/// alternative (drop the connection) loses diagnostic value for
-/// honest peers caught by a transient identity glitch. The body
-/// stays terse and the message cites the spec.
-fn suppressed_error_response(new_id: &str, reason: RejectReason) -> ErrorResponse {
+/// Crucially we MUST NOT echo the `identityMismatch` code or status here
+/// (SPEC §10.4): an unauthenticated prober who POSTs a spoofed in-band
+/// identity would otherwise learn, from the code + 4xx, that this consumer
+/// performs the cross-check and that the identity was contested — an
+/// identity-probing oracle. Collapsing to the indistinguishable generic
+/// rejection removes that signal; the diagnostic loss for honest peers is
+/// the deliberate, safer trade.
+fn suppressed_error_response(new_id: &str) -> ErrorResponse {
     let mut doc = TrustTask::new(
         new_id.to_string(),
-        trust_tasks_rs::TypeUri::canonical("trust-task-error", 0, 1).expect("framework type URI"),
-        ErrorPayload::from(reason).with_message(
-            "identity_mismatch with no transport-authenticated sender — \
-             response not addressed (SPEC §8.1)",
-        ),
+        trust_tasks_rs::TypeUri::canonical("trust-task-error", 0, 2).expect("framework type URI"),
+        ErrorPayload::from(RejectReason::MalformedRequest {
+            reason: String::new(),
+        }),
     );
     doc.issued_at = Some(chrono::Utc::now());
     doc
