@@ -409,6 +409,10 @@ function buildTask(entry, meta, schema, uses) {
     parties: meta.parties.map((p) => p.role),
     partiesDetail: meta.parties,
     proofRequirement: meta.proofRequirement,
+    sideEffects: meta.sideEffects || null,
+    exposure: meta.exposure || null,
+    consequences: meta.consequences || [],
+    subjectPath: meta.subjectPath || null,
     errorCodes: meta.errorCodes || [],
     jsonLdContext: !!meta.jsonLdContext,
     hasResponse,
@@ -493,6 +497,28 @@ window.TT_SHARED_USED_BY = (function () {
       + mid + JSON.stringify(shared, null, 2)
       + footer
   );
+  console.log(`  wrote ${path.relative(ROOT, out)}`);
+}
+
+// Plain-JSON registry for non-browser consumers (the VTA policy engine, the
+// browser-extension / mobile consent surfaces). Same task metadata as
+// tasks.generated.js but framed as JSON with a stable per-entry `typeUri`, so a
+// consumer can key on the Type URI and read sideEffects / exposure / subjectPath
+// without evaluating a `window.*` assignment. Served at
+// https://trusttasks.org/registry.json.
+function emitRegistryJson(tasks) {
+  const out = path.join(WEBSITE_DIR, 'registry.json');
+  const entries = tasks.map((t) => ({
+    typeUri: `https://trusttasks.org/spec/${t.slug}/${t.version}`,
+    ...t
+  }));
+  const doc = {
+    metaSchema: 'https://trusttasks.org/internal/spec-meta/2.0',
+    generatedAt: new Date().toISOString(),
+    tasks: entries
+  };
+  fs.mkdirSync(path.dirname(out), { recursive: true });
+  fs.writeFileSync(out, JSON.stringify(doc, null, 2));
   console.log(`  wrote ${path.relative(ROOT, out)}`);
 }
 
@@ -613,6 +639,7 @@ function main() {
   tasks.sort((a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : a.version < b.version ? 1 : -1));
   sharedRecords.sort((a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
   emitTasks(tasks, sharedRecords);
+  emitRegistryJson(tasks);
   syncWebsiteSpecs();
   syncWebsiteBindings();
   syncWebsiteFrameworkSpec();
