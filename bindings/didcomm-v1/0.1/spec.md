@@ -47,7 +47,7 @@ This binding carries the document in an **`~attach` decorator** ([RFC 0017](http
 {
   "@id": "8f1c9e2a-1b81-4d3e-9b51-7a3c89e3d1f2",
   "@type": "did:sov:BzCbsNYhMrjHiqZDTUASHg;spec/basicmessage/1.0/message",
-  "~thread": { "thid": "urn:uuid:4a0e2b77-88c1-4d55-9f2a-6c3d1e5b7a92" },
+  "~thread": { "thid": "4a0e2b77-88c1-4d55-9f2a-6c3d1e5b7a92" },
   "content": "Trust Task: https://trusttasks.org/spec/acl/grant/0.1",
   "~attach": [{
     "@id": "trust-task",
@@ -67,6 +67,8 @@ A *producer* **SHOULD** set `content` to a short human-readable summary naming t
 
 A message **MAY** carry other `~attach` entries. A *consumer* **MUST** select by `@id` rather than position, and **MUST** reject a message with no `trust-task` attachment.
 
+Implementations differ on which decorators they add to a `basic-message` — return-route, timing, localization, acknowledgement requests — and none of them carry binding semantics. A *consumer* **MUST** ignore decorators it does not recognize. A *producer* **SHOULD** set `sent_time` (RFC 0095 defines it, and some stacks always populate it); a *consumer* **MUST NOT** require it.
+
 ### 2.1 Why an attachment
 
 Recorded because the alternatives are reasonable and a reviewer should see them weighed.
@@ -78,6 +80,13 @@ Recorded because the alternatives are reasonable and a reviewer should see them 
 **`~attach`** is the idiomatic Aries home for a structured payload. It keeps the document as JSON, leaves `content` free for the summary, and uses tooling that already exists.
 
 ⚠ **Open, and worth revisiting:** whether `basic-message` is the right carrier at all. Its assumed advantage is reach — unmodified wallets already surface it — but a Trust Task *consumer* needs a handler under any of the three options above, and v1 mediator forwarding is type-agnostic, so a dedicated `@type` would route just as well and would mirror `binding/didcomm/0.1` more closely. The trade is ecosystem familiarity against not pretending a Trust Task is a chat message.
+
+### 2.2 Implementation notes (Aries frameworks)
+
+Recorded from the first Credo implementation (Credo 0.6.3 — the framework current Aries-lineage wallets ship), exercised agent-to-agent and through a production Aries mediator; the carriage above worked unchanged in both topologies.
+
+- **Producing takes the message layer, not the chat API.** The high-level basic-message APIs (Credo: `basicMessages.sendMessage(connectionId, content)`) accept a display string only — there is no attachment parameter. A *producer* constructs the message at the framework's message layer (in Credo: a `DidCommBasicMessage` with `appendedAttachments`, dispatched through the message sender). A Trust Task client is therefore a small module of its own, not a wrapper over the chat API.
+- **The attachment may not survive transport storage.** Credo's persisted basic-message record keeps `content` only; the `~attach` decorator is reachable solely on the in-flight message event. A *consumer* **MUST** obtain the document from the received message (or persist the document itself) rather than relying on the transport's message store.
 
 ## 3. Identity mapping
 
@@ -114,6 +123,14 @@ Per [SPEC §9.1](https://github.com/trustoverip/dtgwg-trust-tasks-tf/blob/main/S
 | `parentThreadId` ([§4.9.2](https://github.com/trustoverip/dtgwg-trust-tasks-tf/blob/main/SPEC.md#492-the-parentthreadid-member)) | `pthid` |
 
 **Producers.** A *producer* **SHOULD** set `thid` from the document's `threadId`, and `pthid` from its `parentThreadId`. Where the document carries no `threadId`, the *producer* **SHOULD** set `thid` to the document's `id` — §4.9's own fallback, so the v1 thread and the Trust Task exchange are named by one value. Where there is no `parentThreadId`, `pthid` is omitted.
+
+**Representability.** RFC 0008 shapes thread ids as `[-_./a-zA-Z0-9]{8,64}`, and major Aries stacks enforce it: Credo validates every `~thread` field against exactly that pattern (or a bare DID) and refuses to pack a message that fails. A framework id in URI form — `urn:uuid:…`, with its colons — therefore cannot ride the decorator at all: the send is rejected client-side before the envelope is built, on the very stacks this binding exists to reach.
+
+Accordingly:
+
+- A *producer* **MUST NOT** emit a `~thread` field that does not satisfy RFC 0008's shape.
+- Where a document's `threadId` or `parentThreadId` is not representable, the *producer* **MUST omit** that field — never truncate or rewrite it. A rewritten value would disagree with the in-band member, and this section's own comparison rule makes that `malformedRequest`. Nothing is lost that the framework relies on: the in-band members are authoritative and `threadId` carries no normative validation semantics (§4.9); the decorator is derived convenience for transport-level tooling.
+- A *Trust Task* intended to ride this binding **SHOULD** use ids that are themselves RFC 0008-conformant — a bare UUID satisfies both the framework's §4.3 uniqueness obligation and this transport's shape. The framework's examples write ids as `urn:uuid:` URIs, but nothing in the framework requires that form.
 
 Populating the decorator *from* the members, rather than the reverse, is what makes the layers agree. A producer that lets v1 default its own threading produces a message whose `thid` is the DIDComm `@id`, which is a different identifier space entirely — the v1 `@id` is the transport's, unrelated to the document's `id`.
 
