@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://trusttasks.org/spec/vrc/relationship/issue/0.1",
+  "title": "VRC Relationship Issue — payload",
+  "description": "Delivers one party's signed Verifiable Relationship Credential to the other within an accepted relationship exchange. Performed once in each direction; the response is a delivery receipt that does not echo the credential back.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["vrc"],
+  "properties": {
+    "vrc": {
+      "type": "object",
+      "description": "A signed W3C Verifiable Relationship Credential (opaque here). Its issuer MUST be the issuing party's relationship DID and its credential subject MUST name the receiving party's relationship DID — the values the accepted proposal exchanged."
+    },
+    "vrcDigestMultibase": {
+      "type": "string",
+      "pattern": "^z[1-9A-HJ-NP-Za-km-z]+$",
+      "description": "Multibase-encoded multihash over the credential — the registry's converged digest form — so the delivery can be tied to later references to the credential without re-hashing."
+    },
+    "ext": {
+      "$ref": "../../../../_framework/0.2/framework.schema.json#/$defs/Ext"
+    }
+  },
+  "$defs": {
+    "Response": {
+      "$anchor": "response",
+      "title": "VRC Relationship Issue — response payload",
+      "description": "The delivery receipt: the receiving party accepted and stored the credential. A refusal is a trust-task-error, never a receipt with received: false.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["received"],
+      "properties": {
+        "received": {
+          "const": true,
+          "description": "Always true: a refusal travels as a trust-task-error. Present so acceptance is explicit rather than inferred from the response's existence."
+        },
+        "vrcDigestMultibase": {
+          "type": "string",
+          "pattern": "^z[1-9A-HJ-NP-Za-km-z]+$",
+          "description": "Echo of the delivered credential's digest, computed by the receiver, so a mismatch between what was sent and what was stored is detectable in-band."
+        },
+        "ext": {
+          "$ref": "../../../../_framework/0.2/framework.schema.json#/$defs/Ext"
+        }
+      }
+    }
+  }
+}

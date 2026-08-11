@@ -28,6 +28,15 @@ consumer should read it.
 > dependency order `publish.yml` uses. Plan it as one change rather than
 > discovering it mid-bump.
 
+## [0.6.1] - 2026-08-11
+
+### Added
+
+- Generated modules for four new draft specifications — the peer-to-peer
+  witnessed relationship exchange: `vrc/relationship/propose`,
+  `vrc/relationship/issue`, `witness/session`, and `witness/session/submit`.
+  Additive only; no existing module changes.
+
 ## [0.6.0] - 2026-08-10
 
 ### Changed

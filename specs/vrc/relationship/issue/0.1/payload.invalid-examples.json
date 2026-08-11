@@ -1,0 +1,22 @@
+[
+  {
+    "note": "vrc is required — a delivery with no credential delivers nothing.",
+    "payload": {
+      "vrcDigestMultibase": "zQmYtUc4iTCbbNVk9zzEfGRnzks5o1LU7XBcqEXBhZjUC4x"
+    }
+  },
+  {
+    "note": "vrcDigestMultibase must be multibase-multihash (the registry's converged digest form), not a bare hex digest.",
+    "payload": {
+      "vrc": {},
+      "vrcDigestMultibase": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+    }
+  },
+  {
+    "note": "Unknown top-level member is rejected; ecosystem data belongs under `ext` (SPEC.md §4.5.1).",
+    "payload": {
+      "vrc": {},
+      "deliveredBy": "keyring"
+    }
+  }
+]
